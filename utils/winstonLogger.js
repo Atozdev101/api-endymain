@@ -15,6 +15,7 @@ const logFormat = format.combine(
   })
 );
 
+
 // Configure transports based on environment
 const logTransports = [
   new transports.Console(),
