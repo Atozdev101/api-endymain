@@ -1,0 +1,242 @@
+-- ENUMS (no change needed)
+CREATE TYPE domain_status AS ENUM ('Purchased', 'Active', 'Expired', 'Cancelled');
+CREATE TYPE mailbox_status AS ENUM ('Active', 'Inactive', 'Scheduled for Deletion');
+CREATE TYPE record_type AS ENUM ('A', 'AAAA', 'TXT', 'CNAME', 'NS', 'SRV','SPF', 'DKIM', 'MX', 'Nameserver', 'DMARC');
+CREATE TYPE plan_status AS ENUM ('Active', 'Inactive', 'Cancelled');
+CREATE TYPE payment_method AS ENUM ('Credit Card', 'Paypal', 'Wallet');
+CREATE TYPE user_transaction_type AS ENUM ('wallet_topup','domain_purchase','domain_renewal','subscription','mailbox_addon');
+CREATE TYPE subscription_status AS ENUM ('active', 'canceled', 'past_due', 'incomplete', 'trialing');
+CREATE TYPE wallet_txn_type AS ENUM ('topup', 'payment', 'refund');
+CREATE TYPE log_level AS ENUM ('debug', 'info', 'warn', 'error', 'fatal');
+
+--  LINKED USERS Table
+create table public.users (
+  id uuid primary key references auth.users(id) on delete cascade,
+  first_name text,
+  last_name text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+      "email" character varying,
+    "phone" "text",
+    "company" "text",
+    "address1" "text",
+    "address2" "text",
+    "city" "text",
+    "state" "text",
+    "country" "text",
+    "postal_code" "text"
+);
+
+-- DOMAINS
+CREATE TABLE domains (
+    domain_id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    domain_name VARCHAR(255) UNIQUE NOT NULL,
+    status domain_status DEFAULT 'Purchased',
+    mailbox_count INT DEFAULT 0,
+    mailbox_limit INT DEFAULT 10,
+    purchased_on DATE,
+    renews_on DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- DOMAIN SETTINGS
+CREATE TABLE domain_settings (
+    setting_id SERIAL PRIMARY KEY,
+    domain_id INT REFERENCES domains(domain_id) ON DELETE CASCADE,
+    forwarding_email VARCHAR(255),
+    nameserver_1 VARCHAR(255),
+    nameserver_2 VARCHAR(255),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- DNS RECORDS
+CREATE TABLE dns_records (
+    record_id SERIAL PRIMARY KEY,
+    domain_id INT REFERENCES domains(domain_id) ON DELETE CASCADE,
+    record_type record_type NOT NULL,
+    record_value VARCHAR(255) NOT NULL,
+    ttl INT DEFAULT 3600,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- MAILBOXES
+CREATE TABLE mailboxes (
+    mailbox_id SERIAL PRIMARY KEY,
+    domain_id INT REFERENCES domains(domain_id) ON DELETE CASCADE,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255),
+    username VARCHAR(255),
+    status mailbox_status DEFAULT 'Active',
+    recovery_email VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    forwarding_email VARCHAR(255)
+);
+
+-- PLANS
+CREATE TABLE plans (
+    plan_id SERIAL PRIMARY KEY,
+    plan_name VARCHAR(255) UNIQUE NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    mailboxes_included INT NOT NULL,
+    additional_mailbox_price DECIMAL(10, 2),
+    priority_support BOOLEAN DEFAULT FALSE,
+    api_access BOOLEAN DEFAULT FALSE
+);
+
+-- USER SUBSCRIPTIONS
+CREATE TABLE user_subscriptions (
+    subscription_id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    plan_id INT REFERENCES plans(plan_id) ON DELETE CASCADE,
+    status plan_status DEFAULT 'Active',
+    billing_date DATE,
+    renews_on DATE
+    mailboxes_total INT DEFAULT 0,
+    mailboxes_used INT DEFAULT 0;
+);
+
+
+-- WALLET
+CREATE TABLE wallet (
+    wallet_id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    balance DECIMAL(10, 2) DEFAULT 0,
+    auto_topup BOOLEAN DEFAULT FALSE,
+    last_topped_up_at TIMESTAMP,
+    preferred_payment_method VARCHAR(20) DEFAULT 'stripe' -- 'wallet' or 'stripe'
+);
+
+-- WALLET TRANSACTIONS
+CREATE TABLE wallet_transactions (
+    id SERIAL PRIMARY KEY,
+    wallet_id INT REFERENCES wallet(wallet_id) ON DELETE CASCADE,
+    type wallet_txn_type NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    description TEXT,
+    txn_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- TRANSACTION HISTORY (OPTIONAL if using wallet_transactions)
+CREATE TABLE transaction_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    type user_transaction_type NOT NULL,
+    amount INTEGER NOT NULL,                     -- stored in cents (e.g., 1000 = $10.00)
+    currency TEXT NOT NULL DEFAULT 'usd',
+    status TEXT NOT NULL DEFAULT 'pending',      -- e.g., 'pending', 'success', 'failed'
+    payment_provider TEXT NOT NULL,              -- e.g., 'stripe', 'wallet', 'razorpay'
+    reference_id TEXT,                           -- e.g., Stripe PI ID, Wallet TX ID
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+
+-- STRIPE CUSTOMERS
+CREATE TABLE stripe_customers (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    stripe_customer_id VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- STRIPE SUBSCRIPTIONS
+CREATE TABLE stripe_subscriptions (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+    subscription_id VARCHAR(255) UNIQUE NOT NULL,
+    plan_id INT REFERENCES plans(plan_id) ON DELETE SET NULL,
+    status subscription_status DEFAULT 'active',
+    current_period_start TIMESTAMP,
+    current_period_end TIMESTAMP,
+    cancel_at_period_end BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- LOGS TABLE
+CREATE TABLE logs (
+    id SERIAL PRIMARY KEY,
+    user_id UUID REFERENCES public.users(id) ON DELETE SET NULL, -- Optional user association
+    level log_level NOT NULL DEFAULT 'info',
+    message TEXT NOT NULL,
+    context JSONB, -- You can store request data, metadata, error stack etc.
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+-- TRIGGER FUNCTION TO UPDATE `updated_at`
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+   NEW.updated_at = CURRENT_TIMESTAMP;
+   RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- TRIGGERS
+CREATE TRIGGER update_users_updated_at
+BEFORE UPDATE ON public.users
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_domains_updated_at
+BEFORE UPDATE ON domains
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_mailboxes_updated_at
+BEFORE UPDATE ON mailboxes
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+--  AUTO-INSERT public.users AFTER auth.users INSERT
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = ''
+as $$
+begin
+  insert into public.users (id, first_name, last_name, created_at, updated_at)
+  values (
+    new.id,
+    new.raw_user_meta_data ->> 'first_name',
+    new.raw_user_meta_data ->> 'last_name',
+    now(),
+    now()
+  );
+  return new;
+end;
+$$;
+
+-- trigger
+create trigger on_auth_user_created
+after insert on auth.users
+for each row execute procedure public.handle_new_user();
+
+-- Function to update `updated_at` on row modification
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply to all tables
+CREATE TRIGGER trg_domains_updated_at
+BEFORE UPDATE ON domains
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_domain_settings_updated_at
+BEFORE UPDATE ON domain_settings
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER trg_dns_records_updated_at
+BEFORE UPDATE ON dns_records
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
