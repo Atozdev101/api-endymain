@@ -13,8 +13,13 @@ const app = express();
 app.post('/webhook', bodyParser.raw({ type: 'application/json' }), stripeWebhookController.handleStripeWebhook);
 
 // Middlewares
-app.use(helmet());
-app.use(cors());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+app.use(cors({
+  origin: true, // Allow all origins
+  credentials: true
+}));
 app.use(express.json());
 
 
@@ -59,6 +64,7 @@ app.use(errorHandler);
 
 // Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, async () => {
-  console.log(`🚀 V.37 Server running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`🚀 V.37 Server running on http://0.0.0.0:${PORT}`);
+  console.log(`   Accessible from: http://localhost:${PORT} or http://<your-ip>:${PORT}`);
 });
