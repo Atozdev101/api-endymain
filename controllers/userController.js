@@ -75,32 +75,135 @@ exports.userUpdate = async (req, res) => {
     postalCode,
   } = req.body;
   try {
+    // Build update object only with provided fields (not undefined)
+    const updateData = {};
+    if (firstName !== undefined) updateData.first_name = firstName;
+    if (lastName !== undefined) updateData.last_name = lastName;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (company !== undefined) updateData.company = company;
+    if (address1 !== undefined) updateData.address1 = address1;
+    if (address2 !== undefined) updateData.address2 = address2;
+    if (city !== undefined) updateData.city = city;
+    if (state !== undefined) updateData.state = state;
+    if (country !== undefined) updateData.country = country;
+    if (postalCode !== undefined) updateData.postal_code = postalCode;
+
+    // Check if there's anything to update
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: 'No fields provided to update' });
+    }
+
+    // Update public.users table
     const { data, error } = await db
       .from('users')
-      .update({
-        first_name: firstName,
-        last_name: lastName,
-        email: email,
-        phone: phone,
-        company: company,
-        address1: address1,
-        address2: address2,
-        city: city,
-        state: state,
-        country: country,
-        postal_code: postalCode
-      })
-      .eq('id', user.id);
+      .update(updateData)
+      .eq('id', user.id)
+      .select()
+      .single();
 
     if (error) {
-      logger.error('Failed to update user profile:', error);
+      logger.error('Failed to update user profile:', {
+        user_id: user.id,
+        error: error.message,
+        updateData
+      });
       return res.status(500).json({ error: 'Failed to update profile' });
     }
 
-    res.status(200).json({ message: 'Profile updated successfully' });
+    // Verify that the update actually happened
+    if (!data) {
+      logger.error('Update query returned no data:', {
+        user_id: user.id,
+        updateData
+      });
+      return res.status(404).json({ error: 'User not found or update failed' });
+    }
+
+    // Also update auth.users metadata to keep them in sync
+    // This prevents triggers/functions from overwriting public.users data on login
+    try {
+      // Get existing user metadata first to merge with new data
+      const { data: existingAuthUser, error: fetchError } = await db.auth.admin.getUserById(user.id);
+      
+      if (!fetchError && existingAuthUser?.user) {
+        const existingMetadata = existingAuthUser.user.user_metadata || {};
+        
+        // Build metadata update object, merging with existing metadata
+        const authMetadata = { ...existingMetadata };
+        if (firstName !== undefined) authMetadata.first_name = firstName;
+        if (lastName !== undefined) authMetadata.last_name = lastName;
+        if (phone !== undefined) authMetadata.phone = phone;
+        if (company !== undefined) authMetadata.company = company;
+        if (address1 !== undefined) authMetadata.address1 = address1;
+        if (address2 !== undefined) authMetadata.address2 = address2;
+        if (city !== undefined) authMetadata.city = city;
+        if (state !== undefined) authMetadata.state = state;
+        if (country !== undefined) authMetadata.country = country;
+        if (postalCode !== undefined) authMetadata.postal_code = postalCode;
+
+        // Update auth.users metadata
+        const { error: authError } = await db.auth.admin.updateUserById(
+          user.id,
+          {
+            user_metadata: authMetadata
+          }
+        );
+
+        if (authError) {
+          logger.warn('Failed to update auth.users metadata (non-critical):', {
+            user_id: user.id,
+            error: authError.message
+          });
+          // Don't fail the request if auth metadata update fails
+        } else {
+          logger.info('Auth users metadata updated successfully', {
+            user_id: user.id
+          });
+        }
+      } else if (fetchError) {
+        logger.warn('Failed to fetch existing auth user for metadata update (non-critical):', {
+          user_id: user.id,
+          error: fetchError.message
+        });
+      }
+    } catch (authErr) {
+      logger.warn('Error updating auth.users metadata (non-critical):', {
+        user_id: user.id,
+        error: authErr.message
+      });
+      // Don't fail the request if auth metadata update fails
+    }
+
+    logger.info('User profile updated successfully', {
+      user_id: user.id,
+      updated_fields: Object.keys(updateData)
+    });
+
+    res.status(200).json({ 
+      message: 'Profile updated successfully',
+      user: {
+        id: data.id,
+        firstName: data.first_name,
+        lastName: data.last_name,
+        email: data.email,
+        phone: data.phone,
+        company: data.company,
+        address1: data.address1,
+        address2: data.address2,
+        city: data.city,
+        state: data.state,
+        country: data.country,
+        postalCode: data.postal_code,
+      }
+    });
   }
   catch (err) {
-    logger.error('Error updating user profile', err);
+    logger.error('Error updating user profile', {
+      user_id: user.id,
+      error: err.message,
+      stack: err.stack
+    });
     res.status(500).json({ error: 'Server error' });
   }
 }
