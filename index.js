@@ -17,7 +17,13 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 app.use(cors({
-  origin: true, // Allow all origins
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'https://endy-main.vercel.app',
+    'https://app.endyinboxes.com',
+    process.env.FRONTEND_URL
+  ].filter(Boolean),
   credentials: true
 }));
 app.use(express.json());

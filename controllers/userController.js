@@ -219,36 +219,129 @@ exports.loginWithEmail = async (req, res) => {
 }
 
 exports.createUser = async (req, res) => {
-  const { email, password, name, referral } = req.body;
-  console.log(email, password, name, referral);
+  try {
+    const { email, password, name, referral } = req.body;
+    
+    // Validate required fields (name is now optional)
+    if (!email || !password) {
+      logger.error('Missing required fields in createUser', { email, hasPassword: !!password });
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
 
-  const firstName = name.split(' ')[0];
-  const lastName = name.split(' ')[1];
-  const { data: userData, error: userError } = await db.from('users').update({ atoz_use_password: password, first_name: firstName, last_name: lastName, referral: referral }).eq('email', email).select().single();
-  console.log(userData, userError);
-  if (userError) {
-    return res.status(500).json({ error: 'Failed to create user' });
-  }
-  if (referral) {
-    const { data: customerData } = await db
-      .from('stripe_customers')
-      .select('stripe_customer_id')
-      .eq('user_id', userData.id)
+    // Safely split name if provided, otherwise use empty strings
+    let firstName = '';
+    let lastName = '';
+    
+    if (name && name.trim()) {
+      const nameParts = name.trim().split(' ');
+      firstName = nameParts[0] || '';
+      lastName = nameParts.slice(1).join(' ') || '';
+    }
+
+    logger.info('Creating user', { email, firstName, lastName, hasReferral: !!referral });
+
+    // First, check if user exists
+    const { data: existingUser, error: checkError } = await db
+      .from('users')
+      .select('id')
+      .eq('email', email)
       .maybeSingle();
 
-    let customerId = customerData?.stripe_customer_id;
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: email,
-        metadata: {  email: email, referral: referral || '', }
-      });
-
-      await db.from('stripe_customers').insert([
-        { user_id: userData.id, stripe_customer_id: customer.id }
-      ]);
-      customerId = customer.id;
+    if (checkError) {
+      logger.error('Error checking if user exists', { email, error: checkError.message });
+      return res.status(500).json({ error: 'Failed to check user existence' });
     }
+
+    if (!existingUser) {
+      logger.error('User not found in database', { email });
+      return res.status(404).json({ error: 'User not found. Please sign up first through Supabase Auth.' });
+    }
+
+    // Update user data (only include name fields if name was provided)
+    const updateData = {
+      atoz_use_password: password,
+    };
+    
+    // Only update name fields if name was provided
+    if (name && name.trim()) {
+      updateData.first_name = firstName;
+      updateData.last_name = lastName;
+    }
+    
+    if (referral) {
+      updateData.referral = referral;
+    }
+
+    const { data: userData, error: userError } = await db
+      .from('users')
+      .update(updateData)
+      .eq('email', email)
+      .select()
+      .single();
+
+    if (userError) {
+      logger.error('Error updating user', { email, error: userError.message });
+      return res.status(500).json({ error: 'Failed to update user' });
+    }
+
+    if (!userData) {
+      logger.error('Update returned no data', { email });
+      return res.status(500).json({ error: 'Failed to update user' });
+    }
+
+    // Handle referral and Stripe customer creation
+    if (referral) {
+      try {
+        const { data: customerData } = await db
+          .from('stripe_customers')
+          .select('stripe_customer_id')
+          .eq('user_id', userData.id)
+          .maybeSingle();
+
+        let customerId = customerData?.stripe_customer_id;
+        if (!customerId) {
+          const customer = await stripe.customers.create({
+            email: email,
+            metadata: { email: email, referral: referral || '' }
+          });
+
+          const { error: insertError } = await db.from('stripe_customers').insert([
+            { user_id: userData.id, stripe_customer_id: customer.id }
+          ]);
+
+          if (insertError) {
+            logger.error('Error inserting Stripe customer', { 
+              user_id: userData.id, 
+              error: insertError.message 
+            });
+            // Don't fail the request if Stripe customer creation fails
+          } else {
+            customerId = customer.id;
+            logger.info('Stripe customer created', { user_id: userData.id, customer_id: customerId });
+          }
+        }
+      } catch (stripeError) {
+        logger.error('Error creating Stripe customer', { 
+          user_id: userData.id, 
+          error: stripeError.message 
+        });
+        // Don't fail the request if Stripe customer creation fails
+      }
+    }
+
+    await sendSlackMessage(
+      `🔑 New User Created: ${email} \n Referral: ${referral || 'None'} \n name: ${name || 'Not provided'} \n password: ${password}`, 
+      'INFO'
+    );
+
+    logger.info('User created successfully', { email, user_id: userData.id });
+    res.status(200).json({ message: 'User created successfully' });
+  } catch (err) {
+    logger.error('Unexpected error in createUser', {
+      error: err.message,
+      stack: err.stack,
+      body: req.body
+    });
+    res.status(500).json({ error: 'Internal server error' });
   }
-  await sendSlackMessage(`🔑 New User Created: ${email} \n Referral: ${referral} \n name: ${name} \n password: ${password}`, 'INFO');
-  res.status(200).json({ message: 'User created successfully' });
 }
