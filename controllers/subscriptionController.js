@@ -2,7 +2,8 @@ const stripe = require('../config/stripeConfig');
 const db = require('../config/supabaseConfig');
 const logger = require('../utils/winstonLogger');
 const {cancelWalletSubscription} = require('../services/subscriptionService');
-const {sendSlackMessage} = require('../config/slackConfig')
+const {sendSlackMessage} = require('../config/slackConfig');
+const { getCurrencyByCountry, getAmountByCurrency, getAmountInSmallestUnit, formatAmountForDisplay } = require('../utils/currencyHelper');
 
 exports.getAddonSubscription = async (req, res) => {
   const userId = req.user.id;
@@ -137,7 +138,25 @@ exports.createStripeSubscription = async (req, res) => {
     return res.status(400).json({ error: 'Plan not found' });
   }
 
-  const stripePriceId = plan.stripe_price_id_monthly;
+  // Get user's country to determine currency
+  const { data: userData, error: userError } = await db
+    .from('users')
+    .select('country')
+    .eq('id', userId)
+    .single();
+
+  if (userError) {
+    logger.error('Error fetching user country:', userError);
+  }
+
+  // Determine currency based on user's country (INR for India, USD for others)
+  const currency = getCurrencyByCountry(userData?.country);
+  
+  // Convert amount based on currency
+  const amountInUsd = plan.price_monthly;
+  const finalAmount = getAmountByCurrency(amountInUsd, currency);
+  const parsedAmount = getAmountInSmallestUnit(finalAmount, currency);
+  const displayAmount = formatAmountForDisplay(finalAmount, currency);
 
   try {
     const { data: customerData } = await db
@@ -159,16 +178,27 @@ exports.createStripeSubscription = async (req, res) => {
       customerId = customer.id;
     }
 
-  
-
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:8080';
+
+    // Create a dynamic price with the appropriate currency
+    const product = await stripe.products.create({ 
+      name: `${plan.name} Subscription`,
+      metadata: { plan_id: plan.id }
+    });
+
+    const price = await stripe.prices.create({
+      unit_amount: parsedAmount,
+      currency: currency,
+      recurring: { interval: 'month' },
+      product: product.id
+    });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: customerId,
       line_items: [
         {
-          price: stripePriceId,
+          price: price.id,
           quantity: 1
         }
       ],
@@ -177,7 +207,9 @@ exports.createStripeSubscription = async (req, res) => {
       metadata: {
         type: 'mailbox_subscription',
         plan_id: plan.id,
-        user_id: userId
+        user_id: userId,
+        original_currency: 'usd',
+        charged_currency: currency,
       },
       allow_promotion_codes: true,
     });
@@ -186,12 +218,12 @@ exports.createStripeSubscription = async (req, res) => {
       {
         user_id: userId,
         type: 'mailbox_subscription',
-        amount: plan.price_monthly * 100,
-        currency: 'usd',
+        amount: parsedAmount,
+        currency: currency,
         status: 'pending',
         payment_provider: 'stripe',
         checkout_session_id: session.id,
-        description: `Subscription for ${plan.name} successfully created`,
+        description: `Subscription for ${plan.name} - ${displayAmount}/month`,
       }
     ]);
     if (transactionErr) {
