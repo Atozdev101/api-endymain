@@ -223,6 +223,244 @@ exports.getTransactionBySessionId = async (req, res) => {
   return res.status(200).json(transformed);
 };
 
+/**
+ * Attach a payment method to a Stripe customer
+ * POST /api/payments/attach-payment-method
+ * Body: { payment_method_id }
+ */
+exports.attachPaymentMethod = async (req, res) => {
+  try {
+    const { payment_method_id } = req.body;
+    const userId = req.user.id;
+
+    if (!payment_method_id) {
+      return res.status(400).json({ 
+        error: 'Validation Error',
+        message: 'payment_method_id is required' 
+      });
+    }
+
+    // Get Stripe customer ID
+    const { data: customerData, error: customerError } = await db
+      .from('stripe_customers')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (customerError && customerError.code !== 'PGRST116') {
+      logger.error('Error fetching Stripe customer:', customerError);
+      return res.status(500).json({ 
+        error: 'Internal Server Error',
+        message: 'Failed to fetch customer data' 
+      });
+    }
+
+    let customerId = customerData?.stripe_customer_id;
+
+    // If no customer exists, create a new Stripe customer
+    if (!customerId) {
+      const { data: userData } = await db
+        .from('users')
+        .select('email')
+        .eq('id', userId)
+        .single();
+
+      const newCustomer = await stripe.customers.create({
+        email: userData?.email || req.user.email,
+        metadata: { user_id: userId }
+      });
+
+      const { error: insertError } = await db.from('stripe_customers').insert([
+        { user_id: userId, stripe_customer_id: newCustomer.id }
+      ]);
+
+      if (insertError) {
+        logger.error('Error inserting new customer:', insertError);
+        return res.status(500).json({ 
+          error: 'Internal Server Error',
+          message: 'Failed to create customer record' 
+        });
+      }
+
+      customerId = newCustomer.id;
+    }
+
+    // Attach payment method to customer
+    try {
+      await stripe.paymentMethods.attach(payment_method_id, {
+        customer: customerId,
+      });
+    } catch (attachError) {
+      // Payment method might already be attached
+      if (attachError.code === 'resource_already_exists') {
+        logger.info(`Payment method ${payment_method_id} already attached to customer ${customerId}`);
+      } else {
+        logger.error('Error attaching payment method:', attachError);
+        return res.status(400).json({ 
+          error: 'Payment Method Error',
+          message: 'Failed to attach payment method: ' + attachError.message 
+        });
+      }
+    }
+
+    // Optionally set as default payment method
+    try {
+      await stripe.customers.update(customerId, {
+        invoice_settings: {
+          default_payment_method: payment_method_id,
+        },
+      });
+    } catch (updateError) {
+      // Log but don't fail - attachment was successful
+      logger.warn('Error setting default payment method:', updateError);
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Payment method attached successfully',
+      payment_method_id,
+      customer_id: customerId
+    });
+  } catch (error) {
+    logger.error('Error in attachPaymentMethod:', error);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: 'Failed to attach payment method: ' + error.message 
+    });
+  }
+};
+
+/**
+ * Get all saved payment methods for the authenticated user
+ * GET /api/payments/payment-methods
+ */
+exports.getPaymentMethods = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get Stripe customer ID
+    const { data: customerData, error: customerError } = await db
+      .from('stripe_customers')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (customerError && customerError.code !== 'PGRST116') {
+      logger.error('Error fetching Stripe customer:', customerError);
+      return res.status(500).json({ 
+        error: 'Internal Server Error',
+        message: 'Failed to fetch customer data' 
+      });
+    }
+
+    if (!customerData || !customerData.stripe_customer_id) {
+      // No customer means no payment methods
+      return res.json({ payment_methods: [] });
+    }
+
+    // List payment methods for customer
+    const paymentMethods = await stripe.paymentMethods.list({
+      customer: customerData.stripe_customer_id,
+      type: 'card',
+    });
+
+    // Format response
+    const formatted = paymentMethods.data.map(pm => ({
+      id: pm.id,
+      type: pm.type,
+      card: {
+        brand: pm.card.brand,
+        last4: pm.card.last4,
+        exp_month: pm.card.exp_month,
+        exp_year: pm.card.exp_year,
+        funding: pm.card.funding,
+      },
+      billing_details: {
+        name: pm.billing_details.name,
+        email: pm.billing_details.email,
+      },
+      created: pm.created,
+    }));
+
+    res.json({ 
+      success: true,
+      payment_methods: formatted 
+    });
+  } catch (error) {
+    logger.error('Error in getPaymentMethods:', error);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: 'Failed to fetch payment methods: ' + error.message 
+    });
+  }
+};
+
+/**
+ * Delete a payment method
+ * DELETE /api/payments/payment-methods/:payment_method_id
+ */
+exports.deletePaymentMethod = async (req, res) => {
+  try {
+    const { payment_method_id } = req.params;
+    const userId = req.user.id;
+
+    if (!payment_method_id) {
+      return res.status(400).json({ 
+        error: 'Validation Error',
+        message: 'payment_method_id is required' 
+      });
+    }
+
+    // Get Stripe customer ID to verify ownership
+    const { data: customerData, error: customerError } = await db
+      .from('stripe_customers')
+      .select('stripe_customer_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (customerError || !customerData) {
+      return res.status(404).json({ 
+        error: 'Not Found',
+        message: 'Stripe customer not found' 
+      });
+    }
+
+    // Verify payment method belongs to customer
+    try {
+      const paymentMethod = await stripe.paymentMethods.retrieve(payment_method_id);
+      
+      if (paymentMethod.customer !== customerData.stripe_customer_id) {
+        return res.status(403).json({ 
+          error: 'Forbidden',
+          message: 'Payment method does not belong to your account' 
+        });
+      }
+
+      // Detach payment method from customer
+      await stripe.paymentMethods.detach(payment_method_id);
+
+      res.json({ 
+        success: true,
+        message: 'Payment method deleted successfully' 
+      });
+    } catch (stripeError) {
+      if (stripeError.code === 'resource_missing') {
+        return res.status(404).json({ 
+          error: 'Not Found',
+          message: 'Payment method not found' 
+        });
+      }
+      throw stripeError;
+    }
+  } catch (error) {
+    logger.error('Error in deletePaymentMethod:', error);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: 'Failed to delete payment method: ' + error.message 
+    });
+  }
+};
+
 
 
 

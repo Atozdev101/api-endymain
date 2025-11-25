@@ -46,6 +46,7 @@ const subscriptionRoutes = require('./routes/subscriptionRoutes');
 const mailboxRoutes = require('./routes/mailboxRoutes');
 const prewarmMailboxRoutes = require('./routes/prewarmMailboxRoutes');
 const supportRoutes = require('./routes/supportRoutes');
+const apiRoutes = require('./routes/apiRoutes');
 // const dnsRoutes = require('./routes/dnsRoutes');
 
 app.use('/api/users', userRoutes);
@@ -56,6 +57,8 @@ app.use('/api/subscription', subscriptionRoutes);
 app.use('/api/mailboxes', mailboxRoutes);
 app.use('/api/prewarm-mailboxes', prewarmMailboxRoutes);
 app.use('/api/support', supportRoutes);
+// REST API routes with API key authentication
+app.use('/api/v1', apiRoutes);
 // app.use('/api/dns', dnsRoutes);
 
 // Health Check
