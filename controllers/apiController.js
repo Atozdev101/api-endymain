@@ -5,6 +5,7 @@ const namecheapService = require('../services/namecheapService');
 const { sendSlackMessage } = require('../config/slackConfig');
 const { logUserActivity } = require('../utils/userRecentActivityLogger');
 const { v4: uuidv4 } = require('uuid');
+const { getCurrencyByCountry, getAmountByCurrency, getAmountInSmallestUnit, formatAmountForDisplay } = require('../utils/currencyHelper');
 
 /**
  * Purchase domains via API with billing details
@@ -41,8 +42,26 @@ exports.purchaseDomains = async (req, res) => {
       }
     }
 
-    // Calculate total amount
-    const totalAmount = domains.reduce((sum, d) => sum + (d.price / 100), 0);
+    // Get user's country to determine currency
+    const { data: userData, error: userError } = await db
+      .from('users')
+      .select('email, country')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      logger.error('Error fetching user data:', userError);
+    }
+
+    // Determine currency based on user's country (INR for India, USD for others)
+    const currency = getCurrencyByCountry(userData?.country);
+
+    // Calculate total amount in USD first
+    const totalAmountUsd = domains.reduce((sum, d) => sum + (d.price / 100), 0);
+    
+    // Convert to appropriate currency
+    const totalAmount = getAmountByCurrency(totalAmountUsd, currency);
+    const totalAmountSmallestUnit = getAmountInSmallestUnit(totalAmount, currency);
 
     // Get or create Stripe customer
     let { data: customerData } = await db
@@ -54,12 +73,6 @@ exports.purchaseDomains = async (req, res) => {
     let customerId = customerData?.stripe_customer_id;
 
     if (!customerId) {
-      const { data: userData } = await db
-        .from('users')
-        .select('email')
-        .eq('id', userId)
-        .single();
-
       const customer = await stripe.customers.create({
         email: userData?.email || req.user.email,
         metadata: { user_id: userId }
@@ -78,10 +91,10 @@ exports.purchaseDomains = async (req, res) => {
       customer: customerId,
     });
 
-    // Create payment intent
+    // Create payment intent with appropriate currency
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(totalAmount * 100),
-      currency: 'usd',
+      amount: totalAmountSmallestUnit,
+      currency: currency,
       customer: customerId,
       payment_method: billing.payment_method_id,
       confirm: true,
@@ -90,7 +103,9 @@ exports.purchaseDomains = async (req, res) => {
         type: 'domain_purchase',
         user_id: userId,
         domains: domains.map(d => d.domain).join(','),
-        years: domains.map(d => d.year).join(',')
+        years: domains.map(d => d.year).join(','),
+        original_currency: 'usd',
+        charged_currency: currency,
       }
     });
 
@@ -107,8 +122,8 @@ exports.purchaseDomains = async (req, res) => {
     await db.from('transaction_history').insert([{
       user_id: userId,
       type: 'domain_purchase',
-      amount: Math.round(totalAmount * 100),
-      currency: 'usd',
+      amount: totalAmountSmallestUnit,
+      currency: currency,
       status: 'succeeded',
       payment_provider: 'stripe',
       checkout_session_id: checkoutSessionId,
@@ -250,6 +265,9 @@ exports.purchaseMailboxes = async (req, res) => {
       });
     }
 
+    // Determine currency based on user's country (INR for India, USD for others)
+    const currency = getCurrencyByCountry(userData?.country);
+
     // Calculate price (same logic as existing purchaseMailbox)
     let userPrice = null;
     const { data: specificUserPrice } = await db
@@ -283,11 +301,11 @@ exports.purchaseMailboxes = async (req, res) => {
       }
     }
 
-    let mailboxPrice;
+    let mailboxPriceUsd;
     if (userPrice) {
-      mailboxPrice = userPrice;
+      mailboxPriceUsd = userPrice;
     } else if (planPricePerMailbox) {
-      mailboxPrice = planPricePerMailbox;
+      mailboxPriceUsd = planPricePerMailbox;
     } else {
       const { data: defaultPlans } = await db
         .from('plans')
@@ -297,10 +315,16 @@ exports.purchaseMailboxes = async (req, res) => {
         .limit(1)
         .single();
 
-      mailboxPrice = defaultPlans?.price_per_additional_mailbox || 5;
+      mailboxPriceUsd = defaultPlans?.price_per_additional_mailbox || 5;
     }
 
-    const totalAmount = mailboxPrice * numberOfMailboxes;
+    const totalAmountUsd = mailboxPriceUsd * numberOfMailboxes;
+    
+    // Convert to appropriate currency
+    const totalAmount = getAmountByCurrency(totalAmountUsd, currency);
+    const mailboxPrice = getAmountByCurrency(mailboxPriceUsd, currency);
+    const totalAmountSmallestUnit = getAmountInSmallestUnit(totalAmount, currency);
+    const priceDisplay = formatAmountForDisplay(mailboxPrice, currency);
 
     // Get or create Stripe customer
     let { data: customerData } = await db
@@ -341,11 +365,11 @@ exports.purchaseMailboxes = async (req, res) => {
       }
     }
 
-    // Create product and price
+    // Create product and price with appropriate currency
     const product = await stripe.products.create({ name: 'Mailbox Add-on' });
     const price = await stripe.prices.create({
-      unit_amount: Math.round(totalAmount * 100),
-      currency: 'usd',
+      unit_amount: totalAmountSmallestUnit,
+      currency: currency,
       recurring: { interval: 'month' },
       product: product.id
     });
@@ -361,7 +385,9 @@ exports.purchaseMailboxes = async (req, res) => {
         metadata: {
           type: 'mailbox_addon',
           numberOfMailboxes,
-          user_id: userId
+          user_id: userId,
+          original_currency: 'usd',
+          charged_currency: currency,
         }
       });
     } catch (subError) {
@@ -434,12 +460,12 @@ exports.purchaseMailboxes = async (req, res) => {
     await db.from('transaction_history').insert([{
       user_id: userId,
       type: 'mailbox_addon',
-      amount: Math.round(totalAmount * 100),
-      currency: 'usd',
+      amount: totalAmountSmallestUnit,
+      currency: currency,
       status: 'succeeded',
       payment_provider: 'stripe',
       checkout_session_id: subscriptionStripe.id,
-      description: `${numberOfMailboxes}x mailbox add-on @ $${mailboxPrice.toFixed(2)} each`
+      description: `${numberOfMailboxes}x mailbox add-on @ ${priceDisplay} each`
     }]);
 
     // Create subscription record
@@ -468,7 +494,7 @@ exports.purchaseMailboxes = async (req, res) => {
     });
 
     await sendSlackMessage(
-      `✅ API Mailbox Purchase\nUser: ${userId}\nMailboxes: ${numberOfMailboxes}\nSubscription: ${subscription_id}`,
+      `✅ API Mailbox Purchase\nUser: ${userId}\nMailboxes: ${numberOfMailboxes}\nCurrency: ${currency.toUpperCase()}\nSubscription: ${subscription_id}`,
       'SUCCESS'
     );
 
@@ -478,7 +504,8 @@ exports.purchaseMailboxes = async (req, res) => {
       subscription_id: subscription_id,
       subscription_stripe_id: subscriptionStripe.id,
       numberOfMailboxes,
-      renewsOn
+      renewsOn,
+      currency: currency.toUpperCase()
     });
 
   } catch (error) {

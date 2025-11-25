@@ -4,6 +4,7 @@ const {sendSlackMessage} = require('../config/slackConfig')
 const stripe = require('../config/stripeConfig');
 const { logUserActivity } = require('../utils/userRecentActivityLogger');
 const { v4: uuidv4 } = require('uuid');
+const { getCurrencyByCountry, getAmountByCurrency, getAmountInSmallestUnit, formatAmountForDisplay } = require('../utils/currencyHelper');
 
 exports.getAvailablePreWarmedMailboxes = async (req, res) => {
   try {
@@ -296,15 +297,19 @@ exports.exportOtherPlatforms = async (req, res) => {
 exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
     const userId = req.user.id;
     //{emails: []}
-          // get the email id by user_id
-          const { data: emailData, error: emailDataErr } = await db.from('users').select('email').eq('id', userId).single();
-          if (emailDataErr) {
+          // get the email id and country by user_id
+          const { data: userData, error: userDataErr } = await db.from('users').select('email, country').eq('id', userId).single();
+          if (userDataErr) {
             await logger.error({
-              message: '❌ Failed to get email id',
-              context: { error: emailDataErr.message },
+              message: '❌ Failed to get user data',
+              context: { error: userDataErr.message },
             });
           }
-          const email = emailData.email;
+          const email = userData.email;
+          
+          // Determine currency based on user's country (INR for India, USD for others)
+          const currency = getCurrencyByCountry(userData?.country);
+          
     const { selectedMailboxes, promo_code } = req.body;
     if (!selectedMailboxes || selectedMailboxes.length <= 0) {
       return res.status(400).json({ error: 'Valid number of mailboxes required' });
@@ -332,7 +337,13 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
         mailbox.price = newPrice;
       });
     }
-    const totalPrice = pwMailboxes.reduce((acc, mailbox) => acc + mailbox.price, 0);
+    // Total price in USD
+    const totalPriceUsd = pwMailboxes.reduce((acc, mailbox) => acc + mailbox.price, 0);
+    
+    // Convert to appropriate currency
+    const totalPrice = getAmountByCurrency(totalPriceUsd, currency);
+    const totalAmountSmallestUnit = getAmountInSmallestUnit(totalPrice, currency);
+    const priceDisplay = formatAmountForDisplay(totalPrice, currency);
 
     const numberOfMailboxes = pwMailboxes.length;
     var emailListId = uuidv4();
@@ -356,7 +367,6 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
     let product = null;
     let price = null;
     try {
-      const totalAmount = totalPrice;
       const { data: customerData } = await db
         .from('stripe_customers')
         .select('stripe_customer_id')
@@ -376,8 +386,8 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
       }
       product = await stripe.products.create({ name: 'Pre-Warmed Mailbox' });
       price = await stripe.prices.create({
-        unit_amount: Math.round(totalAmount * 100),
-        currency: 'usd',
+        unit_amount: totalAmountSmallestUnit,
+        currency: currency,
         recurring: { interval: 'month' },
         product: product.id
       });
@@ -412,7 +422,9 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
           type: 'pre_warm_mailbox',
           emailListId: emailListId,
           numberOfMailboxes,
-          user_id: userId
+          user_id: userId,
+          original_currency: 'usd',
+          charged_currency: currency,
         },
         allow_promotion_codes: true,
       });
@@ -422,12 +434,12 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
         {
           user_id: userId,
           type: 'mailbox_addon',
-          amount: Math.round(totalAmount * 100),
-          currency: 'usd',
+          amount: totalAmountSmallestUnit,
+          currency: currency,
           status: 'pending',
         payment_provider: 'stripe',
         checkout_session_id: session.id,
-        description: `${numberOfMailboxes}x Pre-Warmed Mailbox @ $${totalPrice.toFixed(2)}`
+        description: `${numberOfMailboxes}x Pre-Warmed Mailbox @ ${priceDisplay}`
       }
     ]);
     if (transactionError) {

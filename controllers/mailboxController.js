@@ -4,6 +4,7 @@ const {sendSlackMessage} = require('../config/slackConfig');
 const stripe = require('../config/stripeConfig');
 const { logUserActivity } = require('../utils/userRecentActivityLogger');
 const { v4: uuidv4 } = require('uuid');
+const { getCurrencyByCountry, getAmountByCurrency, getAmountInSmallestUnit, formatAmountForDisplay } = require('../utils/currencyHelper');
 
 
 exports.getMailboxPrice = async (req, res) => {
@@ -747,6 +748,9 @@ exports.purchaseMailbox = async (req, res) => {
     return res.status(404).json({ error: 'User not found' });
   }
 
+  // Determine currency based on user's country (INR for India, USD for others)
+  const currency = getCurrencyByCountry(userData?.country);
+
   // Check if user email in the specific_user_price table
   const { data: specificUserPrice, error: specificUserPriceError } = await db
     .from('specific_user_price')
@@ -799,15 +803,15 @@ exports.purchaseMailbox = async (req, res) => {
     }
   }
 
-  // Determine the final price per additional mailbox
-  let mailboxPrice;
+  // Determine the final price per additional mailbox (in USD)
+  let mailboxPriceUsd;
   
   if (userPrice) {
     // Use specific user price if available
-    mailboxPrice = userPrice;
+    mailboxPriceUsd = userPrice;
   } else if (planPricePerMailbox) {
     // Use user's plan price if available
-    mailboxPrice = planPricePerMailbox;
+    mailboxPriceUsd = planPricePerMailbox;
   } else {
     // Fallback to default pricing if no active subscription
     const { data: defaultPlans, error: defaultPlansError } = await db
@@ -823,9 +827,16 @@ exports.purchaseMailbox = async (req, res) => {
       return res.status(500).json({ error: 'Error fetching default plan' });
     }
 
-    mailboxPrice = defaultPlans?.price_per_additional_mailbox || 5; // fallback price
+    mailboxPriceUsd = defaultPlans?.price_per_additional_mailbox || 5; // fallback price
   }
-  const totalAmount = mailboxPrice * numberOfMailboxes;
+  
+  const totalAmountUsd = mailboxPriceUsd * numberOfMailboxes;
+  
+  // Convert to appropriate currency
+  const totalAmount = getAmountByCurrency(totalAmountUsd, currency);
+  const mailboxPrice = getAmountByCurrency(mailboxPriceUsd, currency);
+  const totalAmountSmallestUnit = getAmountInSmallestUnit(totalAmount, currency);
+  const priceDisplay = formatAmountForDisplay(mailboxPrice, currency);
 
   let product = null;
   let price = null;
@@ -850,12 +861,12 @@ exports.purchaseMailbox = async (req, res) => {
       customerId = customer.id;
     }
 
-    // Create Stripe product and price
+    // Create Stripe product and price with appropriate currency
     product = await stripe.products.create({ name: 'Mailbox Add-on' });
 
     price = await stripe.prices.create({
-      unit_amount: Math.round(totalAmount * 100),
-      currency: 'usd',
+      unit_amount: totalAmountSmallestUnit,
+      currency: currency,
       recurring: { interval: 'month' },
       product: product.id
     });
@@ -876,7 +887,9 @@ exports.purchaseMailbox = async (req, res) => {
       metadata: {
         type: 'mailbox_addon',
         numberOfMailboxes,
-        user_id: userId
+        user_id: userId,
+        original_currency: 'usd',
+        charged_currency: currency,
       },
       allow_promotion_codes: true,
     });
@@ -885,12 +898,12 @@ exports.purchaseMailbox = async (req, res) => {
       {
         user_id: userId,
         type: 'mailbox_addon',
-        amount: Math.round(totalAmount * 100),
-        currency: 'usd',
+        amount: totalAmountSmallestUnit,
+        currency: currency,
         status: 'pending',
         payment_provider: 'stripe',
         checkout_session_id: session.id,
-        description: `${numberOfMailboxes}x mailbox add-on @ $${mailboxPrice.toFixed(2)} each`,
+        description: `${numberOfMailboxes}x mailbox add-on @ ${priceDisplay} each`,
       }
     ]);
 

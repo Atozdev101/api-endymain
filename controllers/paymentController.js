@@ -1,17 +1,36 @@
 const stripe = require('../config/stripeConfig');
 const db = require('../config/supabaseConfig');
 const logger = require('../utils/winstonLogger');
+const { getCurrencyByCountry, getAmountByCurrency, getAmountInSmallestUnit, formatAmountForDisplay } = require('../utils/currencyHelper');
 
 exports.createDomainPaymentIntent = async (req, res) => {
   try {
-    const { amount, currency = 'usd', domains } = req.body;
-    const parsedAmount = Math.round(Number(amount) * 100); // Convert to cents
+    const { amount, domains } = req.body;
 
-    if (!parsedAmount || !domains || domains.length === 0) {
+    if (!amount || !domains || domains.length === 0) {
       return res.status(400).json({ message: 'Amount and domains are required' });
     }
 
     const userId = req.user.id;
+
+    // Get user's country to determine currency
+    const { data: userData, error: userError } = await db
+      .from('users')
+      .select('country')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      logger.error('Error fetching user country:', userError);
+    }
+
+    // Determine currency based on user's country (INR for India, USD for others)
+    const currency = getCurrencyByCountry(userData?.country);
+    
+    // Convert amount based on currency
+    const amountInUsd = Number(amount);
+    const finalAmount = getAmountByCurrency(amountInUsd, currency);
+    const parsedAmount = getAmountInSmallestUnit(finalAmount, currency);
 
     // Try to fetch existing Stripe customer
     const { data: customerData, error: customerError } = await db
@@ -45,17 +64,25 @@ exports.createDomainPaymentIntent = async (req, res) => {
       customerId = newCustomer.id;
     }
 
-    // Map domain data into Stripe line items
-    const lineItems = domains.map(domain => ({
-      price_data: {
-        currency,
-        product_data: {
-          name: `${domain.domain} - $${(domain.price / 100).toFixed(2)}`
+    // Map domain data into Stripe line items with appropriate currency
+    const lineItems = domains.map(domain => {
+      const domainPriceUsd = domain.price / 100; // Convert cents to dollars
+      const domainPriceFinal = getAmountByCurrency(domainPriceUsd, currency);
+      const domainPriceSmallestUnit = getAmountInSmallestUnit(domainPriceFinal, currency);
+      const priceDisplay = formatAmountForDisplay(domainPriceFinal, currency);
+      
+      return {
+        price_data: {
+          currency,
+          product_data: {
+            name: `${domain.domain} - ${priceDisplay}`
+          },
+          unit_amount: domainPriceSmallestUnit,
         },
-        unit_amount: domain.price, // in cents
-      },
-      quantity: 1,
-    }));
+        quantity: 1,
+      };
+    });
+    
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:8080';
     // Create Stripe Checkout session
     const session = await stripe.checkout.sessions.create({
@@ -70,6 +97,8 @@ exports.createDomainPaymentIntent = async (req, res) => {
         user_id: userId,
         domains: domains.map(d => d.domain).join(','), // Join domain names if needed
         years: domains.map(d => d.year).join(','), // Join years if needed
+        original_currency: 'usd',
+        charged_currency: currency,
       },
       // allow_promotion_codes: true,
     });
@@ -90,7 +119,7 @@ exports.createDomainPaymentIntent = async (req, res) => {
     if (insertRes.error) {
       logger.error('Failed to insert transaction history', insertRes.error);
     } else {
-      logger.info(`Transaction history inserted for user ${userId}`);
+      logger.info(`Transaction history inserted for user ${userId} in ${currency.toUpperCase()}`);
     }
     // Return the Stripe Checkout session URL
     res.json({ url: session.url });
@@ -103,12 +132,32 @@ exports.createDomainPaymentIntent = async (req, res) => {
 
 exports.createtopUpWalletPaymentIntent = async (req, res) => {
   try {
-    const { amount, currency = 'usd' } = req.body;
-    const parsedAmount = Math.round(Number(amount) * 100); // Convert to cents
-    if (!parsedAmount || parsedAmount < 100) {
+    const { amount } = req.body;
+    const amountInUsd = Number(amount);
+    
+    if (!amountInUsd || amountInUsd < 1) {
       return res.status(400).json({ message: 'Amount must be at least $1.00' });
     }
     const userId = req.user.id;
+
+    // Get user's country to determine currency
+    const { data: userData, error: userError } = await db
+      .from('users')
+      .select('country')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      logger.error('Error fetching user country:', userError);
+    }
+
+    // Determine currency based on user's country (INR for India, USD for others)
+    const currency = getCurrencyByCountry(userData?.country);
+    
+    // Convert amount based on currency
+    const finalAmount = getAmountByCurrency(amountInUsd, currency);
+    const parsedAmount = getAmountInSmallestUnit(finalAmount, currency);
+    const displayAmount = formatAmountForDisplay(finalAmount, currency);
 
     // Try to fetch existing Stripe customer
     const { data: customerData, error: customerError } = await db
@@ -164,6 +213,8 @@ exports.createtopUpWalletPaymentIntent = async (req, res) => {
         type: 'wallet_topup',
         user_id: userId,
         parsedAmount,
+        original_amount_usd: amountInUsd,
+        charged_currency: currency,
       },
       allow_promotion_codes: true,
     });
@@ -177,7 +228,7 @@ exports.createtopUpWalletPaymentIntent = async (req, res) => {
         status: 'pending',
         payment_provider: 'stripe',
         checkout_session_id: session.id,
-        description: `Wallet top-up of $${(parsedAmount / 100).toFixed(2)}`
+        description: `Wallet top-up of ${displayAmount}`
       }
     ]);
 
