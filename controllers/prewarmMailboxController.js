@@ -416,6 +416,7 @@ exports.purchaseDomainBasedPreWarmMailbox = async (req, res) => {
             promotion_code: promotionCodeId,
           },
         ],
+        billing_address_collection: 'required',
         success_url: `${frontendUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${frontendUrl}/profile`,
         metadata: {
