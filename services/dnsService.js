@@ -4,9 +4,9 @@ const { sendSlackMessage } = require('../config/slackConfig');
 const dns = require('node:dns/promises');
 
 const REQUIRED_NS = [
-  'ns1.atozemailsns.com.',
-  'ns2.atozemailsns.com.',
-  'ns3.atozemailsns.com.',
+  'ns1.endyns.info.',
+  'ns2.endyns.info.',
+  'ns3.endyns.info.',
 ];
 
 const connectCloudDNSDomain = async (domainName) => {
@@ -87,7 +87,7 @@ exports.checkDomainNS = async (domainData) => {
         if (createRes.status === 'Success') {
           await db
             .from('domains')
-            .update({ status: 'Propagating', lastcheck: new Date(), ns: 'atozemailsns.com' })
+            .update({ status: 'Propagating', lastcheck: new Date(), ns: 'endyns.info' })
             .eq('domain_name', domainName);
 
           sendSlackMessage(`🌐 Zone created for ${domainName}. Waiting for NS propagation.`, 'INFO');
@@ -125,7 +125,7 @@ exports.checkDomainNS = async (domainData) => {
       if (isPropagated) {
         await db
           .from('domains')
-          .update({ status: 'Active', lastcheck: new Date(), ns: 'atozemailsns.com' })
+          .update({ status: 'Active', lastcheck: new Date(), ns: 'endyns.info' })
           .eq('domain_name', domainName);
 
         console.log(`✅ ${domainName} is now Active.`);
@@ -139,7 +139,7 @@ exports.checkDomainNS = async (domainData) => {
       } else {
         await db
           .from('domains')
-          .update({ status: 'Propagating', lastcheck: new Date(), ns: 'atozemailsns.com' })
+          .update({ status: 'Propagating', lastcheck: new Date(), ns: 'endyns.info' })
           .eq('domain_name', domainName);
 
         console.log(`⏳ ${domainName} still propagating...`);

@@ -163,7 +163,7 @@ exports.connectDomain = async (req, res) => {
         user_id: userId,
         status: 'Pending',
         domain_source: 'Connected',
-        ns: 'atozemailsns.com'
+        ns: 'endyns.info'
       });
     if (insertDomainError) {
       logger.error('Error inserting domain:', insertDomainError);
